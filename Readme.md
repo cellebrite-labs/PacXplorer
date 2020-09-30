@@ -8,7 +8,7 @@ This is accomplished by leveraging PAC codes in ARM64e binaries.
 
 ### Preliminary Analysis
 1. open an IDB and make sure autoanalysis has finished  
-1.1. *KernelCache only:* make sure to run [ida_kernelcache](https://gitlab.cellebrite.srl/srl/ios/ida_kernelcache). This defines the `` `vtable for'`` symbols
+1.1. *KernelCache only:* make sure to run [ida_kernelcache](https://github.com/bazad/ida_kernelcache). This defines the `` `vtable for'`` symbols
 2. from the menu select `Edit -> Plugins -> PacXplorer -> Analyse IDB`  
 2.2. if asked, point PacXplorer to the original input binary file that created the IDB
     * this will only happen if the original PAC codes are not present in the IDB and the input binary can't be located automatically
