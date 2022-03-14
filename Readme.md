@@ -3,7 +3,7 @@ PacXplorer is an IDA plugin that adds XREFs between virtual functions and their 
 This is accomplished by leveraging PAC codes in ARM64e binaries.
 ## Installation
 1. install [ida-nentode](https://github.com/williballenthin/ida-netnode) somewhere IDA can import it
-2. clone the repository and symlink `~/.idapro/plugins/pacxploer.py` to `pacxplorer.py` in the cloned repo
+2. clone the repository and symlink `~/.idapro/plugins/pacxplorer.py` to `pacxplorer.py` in the cloned repo
 ## Usage
 
 ### Preliminary Analysis
