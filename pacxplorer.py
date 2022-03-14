@@ -377,6 +377,7 @@ class MovkAnalyzer(object):
     GOOD_MOVK_COMMENT = 'This MOVK has PAC xrefs'
     BAD_STATICVTBL_MOVK_COMMENT = 'This MOVK has **NO** PAC xrefs (static vtable)'
     BAD_ERROR_MOVK_COMMENT = 'This MOVK has **NO** PAC xrefs (analysis error, please report!)'
+    BAD_INDIRECT_REG_VAL = 'Could not find register value for indirect op (analysis error, please report!)'
 
     def __init__(self, cache):
         self.cache = cache  # cache for analyzed data
@@ -523,7 +524,23 @@ class MovkAnalyzer(object):
                     ctx_reg = insn.Op2.reg
                 elif mnem == 'ADD':
                     ctx_reg = insn.Op2.reg
-                    offset += insn.Op3.value
+                    if insn.Op3.type == idaapi.o_idpspec0:
+                        indirect_reg = insn.Op3.reg
+                        sliding_ea = insn.ea
+                        while sliding_ea >= cur_func_start:
+                            prev_insn, _ = idautils.DecodePrecedingInstruction(sliding_ea)
+                            
+                            if prev_insn is None:
+                                trace.append('ERROR FINDING VALUE FOR REG IN INDIRECT OP')
+                                cls.add_comment(sliding_ea, cls.BAD_INDIRECT_REG_VAL)
+                                break
+                            elif prev_insn.get_canon_mnem() == "MOV" and prev_insn.Op1.reg == indirect_reg:
+                                offset += prev_insn.Op2.value
+                                break
+
+                            sliding_ea = prev_insn.ea
+                    else:
+                        offset += insn.Op3.value
                 else:
                     trace.append('ERROR BAD MODIFY')
                     #cls.add_comment(addr, cls.BAD_ERROR_MOVK_COMMENT)
@@ -747,8 +764,8 @@ class PacxplorerPlugin(idaapi.plugin_t, idaapi.UI_Hooks):
         """plugin_t init() function"""
         super(PacxplorerPlugin, self).__init__()
 
-        typename = idaapi.get_file_type_name()
-        if 'ARM64e' not in typename:
+        typename = idaapi.get_file_type_name().lower()
+        if 'arm64e' not in typename:
             print('%s: IDB deemed unsuitable (not an ARM64e binary). Skipping...' % self.wanted_name)
             return idaapi.PLUGIN_SKIP
 
