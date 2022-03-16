@@ -8,7 +8,7 @@ This is accomplished by leveraging PAC codes in ARM64e binaries.
 
 ### Preliminary Analysis
 1. open an IDB and make sure autoanalysis has finished  
-1.1. *KernelCache only:* make sure to run [ida_kernelcache](https://gitlab.cellebrite.srl/srl/ios/ida_kernelcache). This defines the `` `vtable for'`` symbols
+1.1. *KernelCache only:* make sure to run [ida_kernelcache(Cellebrite's fork)](https://github.com/cellebrite-srl/ida_kernelcache). This defines the `` `vtable for'`` symbols
 2. from the menu select `Edit -> Plugins -> PacXplorer -> Analyse IDB`  
 2.2. if asked, point PacXplorer to the original input binary file that created the IDB
     * this will only happen if the original PAC codes are not present in the IDB and the input binary can't be located automatically
@@ -93,7 +93,7 @@ Think of a function that selects a command handler with a switch-case, and all t
  
 ## Limitations
 1. Works only on ARM64e binaries that conform to [the ABI](https://github.com/apple/llvm-project/blob/apple/master/clang/docs/PointerAuthentication.rst#c-virtual-functions)
-2. Vtable symbols need to be present in the binary (`` `vtable for'``). In the case of the Kernel, [ida_kernelcache](https://github.com/bazad/ida_kernelcache) needs to have been run. Note that the official version doesn't support recent Kernels, but forks exist.   
+2. Vtable symbols need to be present in the binary (`` `vtable for'``). In the case of the Kernel, [ida_kernelcache](https://github.com/cellebrite-srl/ida_kernelcache) needs to have been run. Note that the official version doesn't support recent Kernels, but Cellebrite's fork is up to date.  
 3. If the tagged pointers haven't been preserved in the IDB, the original binary is needed for the analysis stage (but not afterwards)
 4. Hexrays support WIP
 
