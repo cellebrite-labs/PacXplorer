@@ -15,17 +15,22 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 from __future__ import print_function
+
+import json
 import mmap
-import idaapi
-import idc
-import idautils
-from netnode import Netnode
-from idaapi import Choose
-from collections import namedtuple
-from functools import wraps, partial
 import os
 import struct
 import sys
+from collections import namedtuple
+from functools import partial, wraps
+
+import ida_hexrays
+import ida_kernwin
+import idaapi
+import idautils
+import idc
+from idaapi import Choose
+from netnode import Netnode
 
 PYTHON3 = sys.version_info.major == 3
 if PYTHON3:
@@ -43,6 +48,9 @@ else:
     iteritems = dict.iteritems
 
 NETNODE = "$ pacxplorer"
+NETNODE_IO = "$ pacxplorer_io"
+NETNODE_RESULT_INPUT = "input"
+NETNODE_RESULT_OUTPUT = "output"
 
 DEBUG_VTABLE_SIZES = False
 FORCE_ORIG_BYTES_FROM_INPUT_FILE = False
@@ -246,13 +254,13 @@ class VtableAnalyzer(object):
 
     # Based on https://github.com/Synacktiv-contrib/kernelcache-laundering/blob/master/ios12_kernel_cache_helper.py
     @staticmethod
-    def get_pac(decorated_addr):
+    def get_pac(decorated_addr, pac_offset, has_bind_bit=True):
         """Return MOVK pac code from decorated pointer"""
-        if decorated_addr & 0x4000000000000000 != 0:
+        if has_bind_bit and decorated_addr & 0x4000000000000000 != 0:
             return None
         if decorated_addr & 0x8000000000000000 == 0:
             return None
-        return (decorated_addr >> 32) & 0xFFFF
+        return (decorated_addr >> pac_offset) & 0xFFFF
 
     @staticmethod
     def _patched_bytes_in_idb():
@@ -306,6 +314,14 @@ class VtableAnalyzer(object):
             <offset of this> --> another base class
             < etc >
             """
+            file_type = idaapi.get_file_type_name().lower()
+            if 'dyld' in file_type and 'cache' in file_type:
+                # DYLD_CHAINED_PTR_ARM64E_SHARED_CACHE: diversity at bits 34..49
+                pac_offset = 34
+            else:
+                # DYLD_CHAINED_PTR_ARM64E[_KERNEL]: diversity at bits 32..47
+                pac_offset = 32
+
 
             for ea, vtable_symbol in iteritems(self.vtable_eas):
 
@@ -338,7 +354,7 @@ class VtableAnalyzer(object):
                             break
 
                         # this is expected to always succeed
-                        pac = self.get_pac(orig_qword)
+                        pac = self.get_pac(orig_qword, pac_offset, has_bind_bit=pac_offset == 32)
                         if pac is not None:
                             xref_to = idaapi.get_qword(ea + offset)
 
@@ -475,6 +491,8 @@ class MovkAnalyzer(object):
         cur_func_start = cur_func.start_ea
 
         insn = idautils.DecodeInstruction(addr)
+        if insn is None:
+            return (None, None)
         mnem = insn.get_canon_mnem()
         if mnem != 'MOVK' or insn.Op2.specval != 48:
             return (None, None)
@@ -500,6 +518,8 @@ class MovkAnalyzer(object):
             visited.add(curr)
 
             insn = idautils.DecodeInstruction(curr)
+            if insn is None:
+                break
             mnem = insn.get_canon_mnem()
             line = idc.GetDisasm(insn.ea)
             line = line.split(';')[0]  # line comments get into the dissasembly
@@ -524,7 +544,8 @@ class MovkAnalyzer(object):
                     ctx_reg = insn.Op2.reg
                 elif mnem == 'ADD':
                     ctx_reg = insn.Op2.reg
-                    if insn.Op3.type == idaapi.o_idpspec0:
+                    # For old IDAs it is o_idpspec0, for IDA 9.0+ it is o_reg
+                    if insn.Op3.type in [idaapi.o_reg, idaapi.o_idpspec0]:
                         indirect_reg = insn.Op3.reg
                         sliding_ea = insn.ea
                         while sliding_ea >= cur_func_start:
@@ -581,6 +602,9 @@ class MovkAnalyzer(object):
 
 
 class _Choose(Choose):
+    # in order to restore the last index of the marker on reopen
+    _markers_idx = {}
+
     # Fix Choose.UI_Hooks_Trampoline to work with modal dialogs
     class UI_Hooks_Trampoline(Choose.UI_Hooks_Trampoline):
         def populating_widget_popup(self, form, popup_handle):
@@ -604,11 +628,14 @@ class _Choose(Choose):
                 else idaapi.AST_DISABLE_FOR_WIDGET
 
     def __init__(self, title, items, columns):
+        self._title = title
+
         Choose.__init__(
             self,
             title,
             columns,
-            flags=Choose.CH_RESTORE)
+            flags=Choose.CH_RESTORE,
+            deflt=_Choose._markers_idx.get(title, 0))
 
         self.items = items
 
@@ -617,6 +644,9 @@ class _Choose(Choose):
 
     def OnGetLine(self, n):
         return self.items[n]
+    
+    def OnSelectionChange(self, sel):
+        _Choose._markers_idx[self._title] = sel        
 
     def show(self):
         selected = self.Show(modal=True)
@@ -684,6 +714,8 @@ class FuncXrefChooser(_Choose):
             [ ["Address", 30 | Choose.CHCOL_PLAIN], ["Address (Hex)", 20 | Choose.CHCOL_HEX],
               ["PAC Code", 20 | Choose.CHCOL_PLAIN] ])
 
+ARG_PAC_CANDIDATES_FROM_MOVK = 5
+ARG_PAC_XREFS_TO_ADDRESS = 6
 
 class PacxplorerPlugin(idaapi.plugin_t, idaapi.UI_Hooks):
     plugin_initialized = False
@@ -746,11 +778,20 @@ class PacxplorerPlugin(idaapi.plugin_t, idaapi.UI_Hooks):
         icon = 151
 
         def activate(self, ctx):
-            self.plugin.choose_window_here()
-            return 1
+            if idaapi.get_widget_type(ctx.widget) == idaapi.BWN_PSEUDOCODE:
+                self.plugin.choose_by_ea(
+                    get_movk_ea_from_current_decompile() or idc.here()
+                )
+            else:
+                self.plugin.choose_window_here()
+            return 0
 
         def update(self, ctx):
-            return idaapi.AST_ENABLE if self.plugin.can_find_xrefs_here() else idaapi.AST_DISABLE
+            if idaapi.get_widget_type(ctx.widget) == idaapi.BWN_PSEUDOCODE:
+                ea = get_movk_ea_from_current_decompile() or idc.here()
+            else:
+                ea = ctx.cur_ea
+            return idaapi.AST_ENABLE if self.plugin.can_find_xrefs(ea) else idaapi.AST_DISABLE
 
     def __init__(self):
         self.analysis_done = False
@@ -759,6 +800,7 @@ class PacxplorerPlugin(idaapi.plugin_t, idaapi.UI_Hooks):
         self.ui_hook = False
         self.analyze_menu = None
         self.jump_xref_menu = None
+        self.input_output_netnode = None
 
     def init(self):
         """plugin_t init() function"""
@@ -772,6 +814,7 @@ class PacxplorerPlugin(idaapi.plugin_t, idaapi.UI_Hooks):
         if not PacxplorerPlugin.plugin_initialized:
             self.analyze_menu = self.AnalyzeMenu(self)
             self.jump_xref_menu = self.JumpXrefMenu(self)
+            self.input_output_netnode = Netnode(NETNODE_IO)
 
             self.ui_hook = True
             self.hook()
@@ -781,7 +824,34 @@ class PacxplorerPlugin(idaapi.plugin_t, idaapi.UI_Hooks):
 
     def run(self, arg=0):
         """plugin_t run() implementation"""
-        return
+        if arg in [ARG_PAC_CANDIDATES_FROM_MOVK, ARG_PAC_XREFS_TO_ADDRESS]:
+            input_ea = self.input_output_netnode.get(NETNODE_RESULT_INPUT)
+            self.input_output_netnode.kill()
+            if input_ea is None:
+                print("%s call %d: did not receive argument for" % (self.wanted_name, arg))
+                return
+            elif not self.analysis_done:
+                print("%s call %d: Analysis was not done" % (self.wanted_name, arg))
+                return
+            
+            if arg == ARG_PAC_CANDIDATES_FROM_MOVK:
+                pac_tuple = self.movk_analyzer.pac_tuple_from_ea(input_ea)
+                if not pac_tuple:
+                    print("%s call %d: Could not find pac tuple for ea %x" % (self.wanted_name, arg, input_ea))
+                    return
+
+                candidates = self.vtable_analyzer.func_from_pac_tuple(pac_tuple)
+                result_serialized = json.dumps([candidate._asdict() for candidate in candidates])
+                self.input_output_netnode[NETNODE_RESULT_OUTPUT] = result_serialized
+            else:
+                pac_codes = self.vtable_analyzer.codes_from_func_addr(input_ea)
+                if not pac_codes:
+                    print("%s call %d: Failed to fund pac code for ea %x" % (self.wanted_name, arg, input_ea))
+                    return
+                
+                movks = self.movk_analyzer.movks_from_pac_codes(pac_codes)
+                result_serialized = json.dumps([[addr, code] for addr,code in movks])
+                self.input_output_netnode[NETNODE_RESULT_OUTPUT] = result_serialized
 
     def term(self):
         """plugin_t term() implementation"""
@@ -806,10 +876,22 @@ class PacxplorerPlugin(idaapi.plugin_t, idaapi.UI_Hooks):
         """
         if not self.analysis_done:
             return
-        if idaapi.get_widget_type(widget) == idaapi.BWN_DISASM and self.can_find_xrefs_here():
-            idaapi.attach_action_to_popup(widget, popup_handle, "-", None, idaapi.SETMENU_FIRST)
-            idaapi.attach_action_to_popup(widget, popup_handle, self.jump_xref_menu.get_name(), None,
-                                          idaapi.SETMENU_FIRST)
+        if (
+            idaapi.get_widget_type(widget) == idaapi.BWN_DISASM
+            and self.can_find_xrefs_here()
+            or idaapi.get_widget_type(widget) == idaapi.BWN_PSEUDOCODE
+            and self.can_find_xrefs(get_movk_ea_from_current_decompile() or idc.here())
+        ):
+            idaapi.attach_action_to_popup(
+                widget, popup_handle, "-", None, idaapi.SETMENU_FIRST
+            )
+            idaapi.attach_action_to_popup(
+                widget,
+                popup_handle,
+                self.jump_xref_menu.get_name(),
+                None,
+                idaapi.SETMENU_FIRST,
+            )
 
     def analyze(self, only_cached=False):
         cache = PickleNetNode(NETNODE)
@@ -921,9 +1003,12 @@ class PacxplorerPlugin(idaapi.plugin_t, idaapi.UI_Hooks):
         self.choose_by_ea(idc.here())
 
     def can_find_xrefs_here(self):
+        return self.can_find_xrefs(idc.here())
+
+    def can_find_xrefs(self, ea):
         if not self.analysis_done:
             return False
-        return self.pick_choose_func_for_ea(idc.here()) is not None
+        return self.pick_choose_func_for_ea(ea) is not None
 
     def choose_file_for_patches(self):
         file_path = idaapi.get_input_file_path()
@@ -935,6 +1020,97 @@ class PacxplorerPlugin(idaapi.plugin_t, idaapi.UI_Hooks):
                         self.wanted_name)
             name = idaapi.ask_file(False, '*', 'locate the input binary')
             return name or None
+        
+def get_func_start(ea):
+    func = idaapi.get_func(ea)
+    if func is None:
+        return -1
+    return func.start_ea
+
+def find_call_from_ea(cfunc, item_ea):
+    insn = idautils.DecodeInstruction(item_ea)
+    while insn is not None and insn.get_canon_mnem() not in ("BLR", "BR"):
+        next_ea = idc.next_head(item_ea)
+        # Wer'e not in the same statement anymore..
+        if (
+            next_ea not in cfunc.eamap
+            or item_ea not in cfunc.eamap
+            or cfunc.eamap[item_ea] != cfunc.eamap[next_ea]
+        ):
+            return None
+        item_ea = next_ea
+        insn = idautils.DecodeInstruction(item_ea)
+    if insn is None:
+        return None
+    return item_ea
+
+def get_movk_ea_from_current_decompile():
+    w = ida_kernwin.get_current_widget()
+    if ida_kernwin.get_widget_type(w) != ida_kernwin.BWN_PSEUDOCODE:
+        return None
+
+    vu = ida_hexrays.get_widget_vdui(w)
+    if vu is None:
+        return None
+
+    if not vu.get_current_item(ida_hexrays.USE_KEYBOARD):
+        return None
+
+    cfunc = vu.cfunc
+    if cfunc is None:
+        return None
+
+    if vu.item.citype in [ida_hexrays.VDI_FUNC, ida_hexrays.VDI_LVAR]:
+        return cfunc.entry_ea
+
+    if not vu.get_current_item(ida_hexrays.USE_KEYBOARD) or not vu.item.is_citem():
+        return None
+
+    citem = vu.item.e
+    if citem is None or cfunc is None:
+        return None
+
+    cfunc_body = cfunc.body
+    has_seen_call = False
+    while citem is not None:
+        citem = citem.cexpr if citem.is_expr() else citem.cinsn
+        if citem.op == ida_hexrays.cot_call:
+            has_seen_call = True
+
+        if has_seen_call:
+            call_ea = find_call_from_ea(cfunc, citem.ea)
+            if call_ea is not None:
+                movk_ea = get_previous_movk(call_ea)
+                if movk_ea is not None:
+                    return movk_ea
+                break
+        citem = cfunc_body.find_parent_of(citem)
+    return None
+
+
+def get_previous_movk(call_ea: int) -> int | None:
+    """Given a call, search previous instructions to find a movk call"""
+    insn = idautils.DecodeInstruction(call_ea)
+    if not insn:
+        return None
+
+    if insn.get_canon_mnem() not in ("BLR", "BR"):
+        return None
+
+    # Get the register for PAC code
+    movk_reg = insn[1].reg
+    # BLR with just one register is unauthenticated, so there will be no PAC xref
+    if movk_reg == 0:
+        return None
+
+    for _ in range(10):
+        insn, _ = idautils.DecodePrecedingInstruction(insn.ea)
+        # No more instructions in this execution flow
+        if insn is None:
+            break
+        if insn.get_canon_mnem() == "MOVK" and insn[0].reg == movk_reg:
+            return insn.ea
+    return None
 
 
 def PLUGIN_ENTRY():

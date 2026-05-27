@@ -70,6 +70,29 @@ PacXplorer looks for the original pointer tags, which will have either been pres
 
 At runtime, a simple matching of these two mappings is performed.
 
+## External usage
+If you want to query PAC Xrefs from your own plugin, you can use the following code:
+```py
+from netnode import Netnode
+n = Netnode("$ pacxplorer_io")
+
+# From call site to virtual function 
+n["input"] = 0x1234 # address of movk
+idaapi.load_and_run_plugin("pacxplorer", 5)
+r = n.get("output")
+if r is not None:
+    # List of dicts with keys: xref_to, vtable_addr, vtable_entry_addr, offset, pac
+    res = json.loads(r)
+
+# From virtual function to call site
+n["input"] = 0x1234 # address of virtual functions
+idaapi.load_and_run_plugin("pacxplorer", 6)
+r = n.get("output")
+if r is not None:
+    # Pairs of possible call site, and pac code.
+    res = json.loads(r)
+```
+
  ## Q&A
 **Q: Why are there several virtual methods in the XREFs window?**  
 **A:** This is the *inherent ambiguity* which is an intrinsic limitation of this method.  
